@@ -1,134 +1,180 @@
-#!/var/ossec/framework/python/bin/python3
-import sys
-import os
-from socket import socket, AF_UNIX, SOCK_DGRAM
-import requests
-from requests.exceptions import ConnectionError
-import json
-import ipaddress
-import re
-import urllib3
+services:
  
-# Disable the InsecureRequestWarning for self-signed certificates
-urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
+  thehive:
+    image: strangebee/thehive:5.2
+    container_name: thehive
+    restart: unless-stopped
+    depends_on:
+      - cassandra
+      - elasticsearch
+      - minio
+      - cortex
+    mem_limit: 1500m
+    ports:
+      - "9000:9000"
+    environment:
+      - JVM_OPTS=-Xms1024M -Xmx1024M
+    command:
+      - --secret
+      - lab123456789
+      - --cql-hostnames
+      - cassandra
+      - --index-backend
+      - elasticsearch
+      - --es-hostnames
+      - elasticsearch
+      - --s3-endpoint
+      - http://minio:9002
+      - --s3-access-key
+      - minioadmin
+      - --s3-secret-key
+      - minioadmin
+      - --s3-use-path-access-style
+    volumes:
+      - thehivedata:/etc/thehive
+    networks:
+      - SOC_NET
  
-# Wazuh socket paths
-pwd = os.path.dirname(os.path.dirname(os.path.realpath(__file__)))
-socket_addr = "{0}/queue/sockets/queue".format(pwd)
+  cassandra:
+    image: cassandra:4
+    container_name: cassandra
+    restart: unless-stopped
+    environment:
+      - CASSANDRA_CLUSTER_NAME=TheHive
+    volumes:
+      - cassandradata:/var/lib/cassandra
+    networks:
+      - SOC_NET
  
-def send_event(msg, agent=None):
-    if not agent or agent["id"] == "000":
-        string = "1:misp:{0}".format(json.dumps(msg))
-    else:
-        string = "1:[{0}] ({1}) {2}->misp:{3}".format(
-            agent["id"],
-            agent["name"],
-            agent["ip"] if "ip" in agent else "any",
-            json.dumps(msg),
-        )
-    sock = socket(AF_UNIX, SOCK_DGRAM)
-    sock.connect(socket_addr)
-    sock.send(string.encode())
-    sock.close()
+  # 🔥 STABLE INTEGRATION ELASTICSEARCH (NOT WAZUH)
+  elasticsearch:
+    image: docker.elastic.co/elasticsearch/elasticsearch:7.17.9
+    container_name: hive-elasticsearch
+    restart: unless-stopped
+    mem_limit: 512m
+    ports:
+      - "127.0.0.1:9201:9200"
+    environment:
+      - discovery.type=single-node
+      - cluster.name=hive
+      - xpack.security.enabled=false
+      - xpack.ml.enabled=false
+      - xpack.watcher.enabled=false
+      - xpack.graph.enabled=false
+      - xpack.monitoring.enabled=false
+      - http.host=0.0.0.0
+      - ES_JAVA_OPTS=-Xms128m -Xmx128m
+    volumes:
+      - elasticsearchdata:/usr/share/elasticsearch/data
+    networks:
+      - SOC_NET
  
-# Read the alert file passed by Wazuh
-try:
-    alert_file = open(sys.argv[1])
-    alert = json.loads(alert_file.read())
-    alert_file.close()
-except Exception:
-    sys.exit()
+  minio:
+    image: quay.io/minio/minio
+    container_name: minio
+    restart: unless-stopped
+    command: ["minio", "server", "/data", "--console-address", ":9002"]
+    environment:
+      - MINIO_ROOT_USER=minioadmin
+      - MINIO_ROOT_PASSWORD=minioadmin
+    ports:
+      - "9002:9002"
+    volumes:
+      - miniodata:/data
+    networks:
+      - SOC_NET
  
-# Configuration using your provided credentials
-misp_base_url = "https://192.168.174.177:8443"
-misp_api_endpoint = "/attributes/restSearch"
-misp_api_auth_key = "Qv5MERRmyzRmJyPdF77PHmoH5D4cRi8TeQpJ7Sfm"
+  cortex:
+    image: thehiveproject/cortex:latest
+    container_name: cortex
+    restart: unless-stopped
+    depends_on:
+      - elasticsearch
+    environment:
+      - job_directory=/tmp/cortex-jobs
+      - docker_job_directory=/tmp/cortex-jobs
+    ports:
+      - "9001:9001"
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+      - /tmp/cortex-jobs:/tmp/cortex-jobs
+      - ./cortex/logs:/var/log/cortex
+      - ./cortex:/cortex
+    networks:
+      - SOC_NET
  
-misp_apicall_headers = {
-    "Content-Type": "application/json",
-    "Authorization": f"{misp_api_auth_key}",
-    "Accept": "application/json",
-}
+  misp:
+    image: coolacid/misp-docker:core-latest
+    container_name: misp
+    restart: unless-stopped
+    depends_on:
+      - misp_mysql
+      - redis
+    ports:
+      - "8080:80"
+      - "443:443"
+    environment:
+      - MYSQL_HOST=misp_mysql
+      - MYSQL_DATABASE=mispdb
+      - MYSQL_USER=mispuser
+      - MYSQL_PASSWORD=misppass
+      - MYSQL_ROOT_PASSWORD=mispass
+      - MISP_ADMIN_EMAIL=mispadmin@lab.local
+      - MISP_ADMIN_PASSPHRASE=mispadminpass
+      - MISP_BASEURL=https://localhost:8443
+      - TIMEZONE=Asia/Kolkata
+      - INIT=true
+      - CRON_USER_ID=1
+      - REDIS_FQDN=redis
+      - HOSTNAME=https://localhost:8443
+    volumes:
+      - ./server-configs:/var/www/MISP/app/Config
+      - ./logs:/var/www/MISP/app/tmp/logs
+      - ./files:/var/www/MISP/app/files
+      - ./ssl:/etc/nginx/certs
+    networks:
+      - SOC_NET
  
-# Regex for SHA256 (64 chars)
-regex_file_hash = re.compile("\w{64}")
-wazuh_event_param = None
-alert_output = {}
+  misp_mysql:
+    image: mysql/mysql-server:5.7
+    container_name: misp_mysql
+    restart: unless-stopped
+    environment:
+      - MYSQL_DATABASE=mispdb
+      - MYSQL_USER=mispuser
+      - MYSQL_PASSWORD=misppass
+      - MYSQL_ROOT_PASSWORD=mispass
+    volumes:
+      - mispsqldata:/var/lib/mysql
+    networks:
+      - SOC_NET
  
-# Extract Source and Type
-try:
-    event_source = alert["rule"]["groups"][0]
-    event_type = alert["rule"]["groups"][2]
-except (KeyError, IndexError):
-    sys.exit()
+  redis:
+    image: redis:latest
+    container_name: redis
+    restart: unless-stopped
+    networks:
+      - SOC_NET
  
-# Logic to identify the IoC (Hash, IP, or Domain)
-if event_source == "windows":
-    if event_type in ["sysmon_event1", "sysmon_event6", "sysmon_event7", "sysmon_event_15", "sysmon_event_23", "sysmon_event_24", "sysmon_event_25"]:
-        try:
-            wazuh_event_param = regex_file_hash.search(alert["data"]["win"]["eventdata"]["hashes"]).group(0)
-        except (IndexError, AttributeError, KeyError): sys.exit()
-    elif event_type == "sysmon_event3":
-        try:
-            dst_ip = alert["data"]["win"]["eventdata"]["destinationIp"]
-            if ipaddress.ip_address(dst_ip).is_global: wazuh_event_param = dst_ip
-        except (IndexError, ValueError, KeyError): sys.exit()
-    elif event_type == "sysmon_event_22":
-        try:
-            wazuh_event_param = alert["data"]["win"]["eventdata"]["queryName"]
-        except (IndexError, KeyError): sys.exit()
+  misp-modules:
+    image: coolacid/misp-docker:modules-latest
+    container_name: misp-modules
+    restart: unless-stopped
+    environment:
+      - REDIS_BACKEND=redis
+    depends_on:
+      - redis
+      - misp_mysql
+    networks:
+      - SOC_NET
  
-elif event_source == "ossec" and event_type == "syscheck_entry_added":
-    try:
-        wazuh_event_param = alert["syscheck"]["sha256_after"]
-    except KeyError: sys.exit()
+volumes:
+  miniodata:
+  cassandradata:
+  elasticsearchdata:
+  thehivedata:
+  mispsqldata:
  
-# If an IoC was found, query MISP
-if wazuh_event_param:
-    misp_search_url = f"{misp_base_url}{misp_api_endpoint}"
-    # Payload includes tags and full event info to gather MORE information
-    misp_search_data = json.dumps({
-        "value": wazuh_event_param,
-        "includeEventDescription": 1,
-        "includeTags": 1
-    })
- 
-    try:
-        misp_api_response = requests.post(
-            misp_search_url, 
-            headers=misp_apicall_headers, 
-            data=misp_search_data, 
-            verify=False,
-            timeout=10
-        )
-        misp_api_response.raise_for_status()
-        res_json = misp_api_response.json()
- 
-        if "Attribute" in res_json["response"] and res_json["response"]["Attribute"]:
-            # Take the first hit
-            attr = res_json["response"]["Attribute"][0]
-            # Enrich with Galaxy/Tags and Event Details
-            tags = [tag.get('name') for tag in attr.get('Tag', [])]
-            evt = attr.get('Event', {})
- 
-            alert_output["misp"] = {
-                "event_id": attr.get("event_id"),
-                "event_info": evt.get("info"),
-                "category": attr.get("category"),
-                "type": attr.get("type"),
-                "value": attr.get("value"),
-                "tags": tags,
-                "comment": attr.get("comment"),
-                "misp_url": f"{misp_base_url}/events/view/{attr['event_id']}",
-                "source_description": alert["rule"]["description"]
-            }
-            alert_output["integration"] = "misp"
-            send_event(alert_output, alert.get("agent"))
-        else:
-            sys.exit()
- 
-    except Exception as e:
-        alert_output["misp"] = {"error": str(e)}
-        alert_output["integration"] = "misp"
-        send_event(alert_output, alert.get("agent"))
-        sys.exit()
+networks:
+  SOC_NET:
+    driver: bridge
