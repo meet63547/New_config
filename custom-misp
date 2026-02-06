@@ -43,7 +43,7 @@ alert_output = {}
 # ---------------------------------------------------
 # MISP Configuration
 # ---------------------------------------------------
-misp_base_url = "https://172.16.2.4/attributes/restSearch/"
+misp_base_url = "https://localhost/attributes/restSearch/"
 misp_api_auth_key = "GjEnvEBqIHWv0yvZFZIRyZjifEYMfMlSHsqo4tZ0"
 
 misp_headers = {
